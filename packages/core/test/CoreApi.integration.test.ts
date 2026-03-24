@@ -11,6 +11,7 @@ import type {
 } from "@trading/shared-domain";
 import { createApp } from "../src/api/createApp.js";
 import { ExecutionService } from "../src/services/ExecutionService.js";
+import { KoreanMarketSession } from "../src/services/KoreanMarketSession.js";
 import { PaperBrokerGateway } from "../src/services/PaperBrokerGateway.js";
 import { RuntimeFlags } from "../src/services/RuntimeFlags.js";
 import type { EventRepo, JournalRepo, OrderRepo, PositionRepo } from "../src/repo/interfaces.js";
@@ -143,6 +144,7 @@ function createTestApp() {
     db: {} as never,
     repos,
     runtimeFlags,
+    marketSession: new KoreanMarketSession(),
     executionService,
     tradingOrchestrator: {
       onMarketEvent: async () => undefined
@@ -177,6 +179,19 @@ describeSocket("Core internal API integration", () => {
       .send(payload);
 
     expect(second.status).toBe(409);
+  });
+
+  it("preflight returns expected shape", async () => {
+    const app = createTestApp();
+    const res = await request(app)
+      .get("/internal/preflight")
+      .set("x-internal-api-key", TEST_API_KEY);
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(typeof res.body.checks.marketSession).toBe("string");
+    expect(res.body.checks.paperMode).toBe(true);
+    expect(res.body.checks.liveMode).toBe(false);
+    expect(res.body.checks.watchlistCount).toBe(1);
   });
 
   it("enables kill switch and blocks new orders", async () => {

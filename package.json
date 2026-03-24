@@ -9,6 +9,7 @@
     "build": "tsc -b",
     "dev:core": "npm run -w @trading/core dev",
     "dev:collector": "npm run -w @trading/collector dev",
+    "dev:web": "npm run -w @trading/web-ui dev",
     "test": "npm run build && npm run -w @trading/core test",
     "lint": "npm run -ws lint"
   },

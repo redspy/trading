@@ -1,3 +1,16 @@
+// ─────────────────────────────────────────────────────────────
+// SQLite 리포지토리 구현
+//
+// OrderRepo, PositionRepo, JournalRepo, EventRepo를 단일 클래스로 구현한다.
+// 모든 쓰기 작업은 WAL 모드 SQLite를 통해 ACID 보장된다.
+//
+// 포지션 손익 계산 방식:
+//   - 매수: 가중 평균 단가 갱신 (qty 가중 평균)
+//   - 매도: FIFO 기준 실현 손익 = (체결가 - 평균 단가) × 수량
+//   - updateMarkPrice: 현재가 기준 미실현 손익 갱신
+//     → 전체 포지션 집계로 daily_pnl 업데이트 (멀티 심볼 정합성 보장)
+// ─────────────────────────────────────────────────────────────
+
 import type {
   DailyPnl,
   ExecutionUpdate,
@@ -26,6 +39,8 @@ type PositionRow = {
 
 export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo, EventRepo {
   public constructor(private readonly db: DatabaseSync) {}
+
+  // ─── OrderRepo ─────────────────────────────────────────────
 
   public create(order: OrderRecord): void {
     this.db
@@ -64,6 +79,7 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
     return row ? this.toOrderRecord(row) : undefined;
   }
 
+  /** NEW/PARTIALLY_FILLED 상태인 동일 심볼/방향 주문 존재 여부 */
   public hasActiveOrder(symbol: string, side: Side): boolean {
     const row = this.db
       .prepare(
@@ -78,6 +94,10 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
     return Number(row.c) > 0;
   }
 
+  /**
+   * 체결 업데이트를 반영한다.
+   * filledQty가 증가한 경우 fills 테이블에 기록하고 포지션도 갱신한다.
+   */
   public updateExecution(update: ExecutionUpdate): void {
     const existing = this.findById(update.orderId);
     if (!existing) {
@@ -92,6 +112,7 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
       )
       .run(update.status, update.filledQty, update.avgPrice, update.ts, update.orderId);
 
+    // 신규 체결 수량이 있으면 fills 기록 및 포지션 반영
     if (update.filledQty > existing.filledQty) {
       const deltaQty = update.filledQty - existing.filledQty;
       this.db
@@ -118,6 +139,14 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
     return rows.map((row) => this.toOrderRecord(row));
   }
 
+  // ─── PositionRepo ──────────────────────────────────────────
+
+  /**
+   * 체결 정보를 포지션에 반영한다.
+   * - 매수: 가중 평균 단가 갱신, 수량 증가
+   * - 매도: 실현 손익 계산, 수량 감소
+   * 이후 daily_pnl 전체 집계를 갱신한다.
+   */
   public applyFill(input: {
     orderId: string;
     symbol: string;
@@ -136,10 +165,12 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
     let realizedPnl = row?.realized_pnl ?? 0;
 
     if (input.side === "BUY") {
+      // 가중 평균 단가 갱신
       const nextQty = qty + input.qty;
       avgPrice = nextQty === 0 ? 0 : (qty * avgPrice + input.qty * input.price) / nextQty;
       qty = nextQty;
     } else {
+      // 매도: 실현 손익 = (체결가 - 평균 단가) × 체결 수량
       const sellQty = Math.min(qty, input.qty);
       realizedPnl += (input.price - avgPrice) * sellQty;
       qty -= sellQty;
@@ -168,6 +199,11 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
     this.updateDailyPnl(input.ts.slice(0, 10));
   }
 
+  /**
+   * 현재가 기준으로 미실현 손익을 갱신한다.
+   * 위치 의존 없이 전체 포지션을 집계해 daily_pnl를 갱신한다.
+   * (단일 심볼 값으로 덮어쓰는 버그를 방지)
+   */
   public updateMarkPrice(symbol: string, lastPrice: number): void {
     const row = this.db
       .prepare("SELECT qty, avg_price, realized_pnl FROM positions WHERE symbol = ?")
@@ -179,7 +215,6 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
 
     const qty = Number(row.qty);
     const avgPrice = Number(row.avg_price);
-    const realizedPnl = Number(row.realized_pnl);
     const unrealizedPnl = (lastPrice - avgPrice) * qty;
 
     this.db
@@ -190,17 +225,9 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
       )
       .run(lastPrice, unrealizedPnl, isoNow(), symbol);
 
+    // 전체 포지션 집계로 daily_pnl 갱신 (멀티 심볼 정합성 보장)
     const today = isoNow().slice(0, 10);
-    this.db
-      .prepare(
-        `INSERT INTO daily_pnl(date, realized_pnl, unrealized_pnl, total_pnl, updated_at)
-         VALUES(?, ?, ?, ?, ?)
-         ON CONFLICT(date) DO UPDATE SET
-         unrealized_pnl = excluded.unrealized_pnl,
-         total_pnl = excluded.total_pnl,
-         updated_at = excluded.updated_at`
-      )
-      .run(today, realizedPnl, unrealizedPnl, realizedPnl + unrealizedPnl, isoNow());
+    this.updateDailyPnl(today);
   }
 
   public list(): Position[] {
@@ -223,12 +250,7 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
       .get(date) as Record<string, unknown> | undefined;
 
     if (!row) {
-      return {
-        date,
-        realizedPnl: 0,
-        unrealizedPnl: 0,
-        totalPnl: 0
-      };
+      return { date, realizedPnl: 0, unrealizedPnl: 0, totalPnl: 0 };
     }
 
     return {
@@ -239,6 +261,8 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
     };
   }
 
+  // ─── JournalRepo ───────────────────────────────────────────
+
   public append(category: string, payload: unknown, ts = isoNow()): void {
     this.db.prepare("INSERT INTO journal_logs(category, payload, ts) VALUES(?, ?, ?)").run(
       category,
@@ -246,6 +270,8 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
       ts
     );
   }
+
+  // ─── EventRepo ─────────────────────────────────────────────
 
   public insertMarketEvent(event: MarketEvent): void {
     this.db
@@ -277,6 +303,12 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
       .run(category, message, metadata ? JSON.stringify(metadata) : null, isoNow());
   }
 
+  // ─── Private ───────────────────────────────────────────────
+
+  /**
+   * 모든 포지션의 realized/unrealized 합계로 daily_pnl를 갱신한다.
+   * applyFill과 updateMarkPrice 모두 이 메서드를 통해 집계한다.
+   */
   private updateDailyPnl(date: string): void {
     const pnl = this.db
       .prepare(
@@ -323,9 +355,6 @@ export class SqliteRepositories implements OrderRepo, PositionRepo, JournalRepo,
       return base;
     }
 
-    return {
-      ...base,
-      price: Number(row.price)
-    };
+    return { ...base, price: Number(row.price) };
   }
 }

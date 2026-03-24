@@ -92,31 +92,38 @@
   - 단위 테스트 통과(전략/리스크/주문상태머신)
   - 통합 테스트 코드 준비 완료(소켓 허용 환경에서 활성화)
 
-### 진행 중
-- KIS 실 API 응답 필드와 현재 내부 모델 매핑 정밀화
-- 실거래 전환 전 운영 안전장치 상세화
+### Phase 2 완료 (2026-03-23)
+- **버그 수정**: `updateMarkPrice` 멀티 심볼 일일 PnL 집계 오류 수정 (`updateDailyPnl` 위임으로 전체 포지션 합산)
+- **KIS TR 필드 매핑 정합화**:
+  - `KisTrMapping.ts` 신규 작성: TR_ID 선택, 요청 바디/쿼리 빌드, 응답 파싱 분리
+  - `placeOrder`: CANO/ACNT_PRDT_CD/PDNO/ORD_DVSN/ORD_QTY/ORD_UNPR 실 필드명 적용
+  - `getOrderUpdates`: inquire-daily-ccld TR, output1[] 배열 파싱
+  - `getLatestQuote`: FHKST01010100 TR, STCK_PRPR/ACML_VOL 파싱
+  - cancelOrder/amendOrder: order-rvsecncl TR 실 필드명 적용
+  - `custtype: "P"` 헤더 전역 적용
+- **KIS WS 프로토콜 수정**:
+  - `getApprovalKey()` → `/oauth2/Approval` 인증 키 취득 구현
+  - subscribe 메시지: approval_key + H0STCNT0 tr_id + tr_key(종목코드) 형식
+  - 메시지 파싱: pipe-delimited(`|`) + caret-delimited(`^`) 실 포맷 적용
+  - H0STCNT0(실시간 체결) / H0STCNI9(체결 통보) 채널 분리 파싱
+- **한국장 세션 상태머신** (`KoreanMarketSession`):
+  - PRE_OPEN(08:00-09:00) / OPEN(09:00-15:30) / CLOSE(15:30-18:00) / AFTER_HOURS
+  - 주말·KRX 공휴일(2026) 자동 판단
+  - `RiskManagerService`에 `MARKET_CLOSED` 규칙 추가 (장외 매수 차단)
+  - `TradingOrchestrator`에 `marketSession.isOpen()` 연동
+- **syncOrderUpdates 30초 고정 룩백 버그 수정**: `lastSyncAt` 변수 추적으로 교체
+- **장 마감 자동 루틴** (EOD): 15:30 KST 이후 1회 주문 동기화 + 일손익 로그 + system_event 기록
+- **Pre-flight 점검 API**: `GET /internal/preflight` — DB, 킬스위치, 모드, 자산, 워치리스트, 세션 상태 반환
+- **테스트 강화**: 22개 테스트 전부 통과 (KoreanMarketSession 10개, RiskManager 5개 포함)
 
-## 10) 앞으로의 실행 계획 (Phase 2~3)
-1. KIS API 정합화
-- 주문/체결/시세 TR별 필드 매핑 표준화
-- 오류 코드/제한 정책(호출 한도, 장중 에러) 반영
-
-2. 장 운영 상태머신 추가
-- 한국장 캘린더/시간대 기준으로 pre-open/open/close 상태 분리
-- 장 종료 시 주문 동기화/정산/리포트 루틴 추가
-
-3. 실행/복구 안정성 강화
-- 주문 실패 재시도 횟수/간격 정책 고정
-- idempotency 키와 중복방지 키 운영 규칙 고도화
-- WS 단절/지연/중복 체결 이벤트 시나리오 테스트 확장
-
-4. 모의투자 운영 검증
+## 10) 앞으로의 실행 계획 (Phase 3)
+1. 모의투자 운영 검증
 - 5영업일 연속 장중 모의운영
 - 합격 기준:
   - 치명 오류 0
   - 중복 주문 0
   - 리스크 규칙 위반 0
 
-5. 실거래 전환 준비
-- 실거래 사전점검 API 및 체크리스트 제공
+2. 실거래 전환 준비
 - 기본은 `LIVE_MODE=false` 유지, 수동 승인 절차 후 소액 전환
+- pre-flight 점검 API 활용한 운영 전 자동 점검 루틴 구축

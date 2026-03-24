@@ -1,6 +1,26 @@
+// ─────────────────────────────────────────────────────────────
+// KIS 데이터 수집기 (Collector)
+//
+// 역할:
+//   KIS WebSocket에서 실시간 시세/체결 이벤트를 수신하여
+//   core 서버의 내부 API로 전달한다.
+//
+// 아키텍처:
+//   KIS WS → KisWsClientImpl → CoreInternalApi → core 서버
+//
+// 이벤트 흐름:
+//   onMarketEvent  → POST /internal/market-events
+//   onExecutionUpdate → POST /internal/execution-updates
+//
+// 종료 처리:
+//   SIGINT/SIGTERM 수신 시 WS 연결을 정상 종료한다.
+// ─────────────────────────────────────────────────────────────
+
 import {
   KisRestClientImpl,
   KisWsClientImpl,
+  MockKisRestClient,
+  MockKisWsClient,
   type KisCredentials,
   type KisRestClient
 } from "@trading/kis-client";
@@ -20,11 +40,16 @@ const envSchema = z.object({
   PAPER_MODE: z
     .string()
     .default("true")
+    .transform((value) => ["1", "true", "TRUE", "yes", "Y"].includes(value)),
+  KIS_MOCK: z
+    .string()
+    .default("false")
     .transform((value) => ["1", "true", "TRUE", "yes", "Y"].includes(value))
 });
 
 type Env = z.infer<typeof envSchema>;
 
+/** core 서버 내부 API 클라이언트 */
 class CoreInternalApi {
   public constructor(private readonly env: Env) {}
 
@@ -67,20 +92,33 @@ async function main(): Promise<void> {
     wsUrl: env.KIS_WS_URL
   };
 
-  const restClient: KisRestClient = new KisRestClientImpl(credentials);
-  const wsClient = new KisWsClientImpl(credentials, restClient, {
-    onMarketEvent: async (event) => {
-      await coreApi.pushMarketEvent(event);
-    },
-    onExecutionUpdate: async (update) => {
-      await coreApi.pushExecutionUpdate(update);
-    },
-    onError: async (error) => {
-      process.stdout.write(
-        `${JSON.stringify({ ts: new Date().toISOString(), level: "error", msg: error.message })}\n`
-      );
-    }
-  });
+  const restClient: KisRestClient = env.KIS_MOCK
+    ? new MockKisRestClient()
+    : new KisRestClientImpl(credentials);
+
+  const wsClient = env.KIS_MOCK
+    ? new MockKisWsClient(credentials, restClient, {
+        onMarketEvent: async (event) => {
+          await coreApi.pushMarketEvent(event);
+        },
+        onExecutionUpdate: async (update) => {
+          await coreApi.pushExecutionUpdate(update);
+        }
+      })
+    : new KisWsClientImpl(credentials, restClient, {
+        onMarketEvent: async (event) => {
+          await coreApi.pushMarketEvent(event);
+        },
+        onExecutionUpdate: async (update) => {
+          await coreApi.pushExecutionUpdate(update);
+        },
+        onError: async (error) => {
+          // 에러는 stderr로 출력 (JSON 구조화 로그)
+          process.stderr.write(
+            `${JSON.stringify({ ts: new Date().toISOString(), level: "error", msg: error.message })}\n`
+          );
+        }
+      });
 
   const symbols = env.WATCHLIST.split(",")
     .map((item) => item.trim())
@@ -91,6 +129,7 @@ async function main(): Promise<void> {
     `${JSON.stringify({ ts: new Date().toISOString(), level: "info", msg: "collector started", symbols })}\n`
   );
 
+  // SIGINT(Ctrl+C) / SIGTERM(컨테이너 종료) 수신 시 정상 종료
   const shutdown = async () => {
     await wsClient.stop();
     process.exit(0);

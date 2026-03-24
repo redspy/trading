@@ -1,3 +1,23 @@
+// ─────────────────────────────────────────────────────────────
+// 데이터베이스 마이그레이션
+//
+// schema_migrations 테이블에 적용된 버전을 기록한다.
+// 이미 적용된 버전은 건너뛰고, 미적용 버전만 순서대로 실행한다.
+// 각 마이그레이션은 트랜잭션으로 감싸 원자성을 보장한다.
+//
+// 테이블 목록 (v1):
+//   market_events   — 수신된 실시간 시세 이벤트
+//   signals         — 전략 엔진이 생성한 매매 신호
+//   risk_decisions  — 리스크 매니저의 허용/차단 결정
+//   orders          — 주문 레코드 (상태 포함)
+//   fills           — 개별 체결 내역 (orders 참조)
+//   positions       — 현재 보유 포지션 및 손익
+//   daily_pnl       — 일별 손익 집계
+//   journal_logs    — 모든 이벤트의 감사 로그
+//   system_events   — 서버 내부 이벤트 (주문 접수, EOD 등)
+//   schema_migrations — 마이그레이션 버전 관리
+// ─────────────────────────────────────────────────────────────
+
 import type { DatabaseSync } from "node:sqlite";
 
 const MIGRATIONS: Array<{ version: number; sql: string }> = [
@@ -108,6 +128,7 @@ const MIGRATIONS: Array<{ version: number; sql: string }> = [
 ];
 
 export function runMigrations(db: DatabaseSync): void {
+  // schema_migrations 테이블이 없으면 먼저 생성
   db.exec(
     `CREATE TABLE IF NOT EXISTS schema_migrations (
       version INTEGER PRIMARY KEY,
